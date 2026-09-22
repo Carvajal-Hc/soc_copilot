@@ -1,0 +1,28 @@
+# Secrets — the real token must never enter git.
+.env
+.env.*
+!.env.example
+
+# Local machine state. settings.local.json records absolute paths and the
+# shape of commands run against this machine's Splunk; none of it is portable
+# and none of it belongs in a public repository.
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store

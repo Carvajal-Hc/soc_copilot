@@ -1,0 +1,130 @@
+[project]
+name = "soc-copilot"
+version = "0.1.0"
+description = "Natural-language triage assistant over Splunk: deterministic read-only Splunk layer, grounded NL->SPL, a tool-using triage loop, and hard-coded guardrails (read-only enforcement, literal anchoring, untrusted-input defence)."
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.31",
+    "python-dotenv>=1.0",
+]
+
+license = "MIT"
+license-files = ["LICENSE"]
+readme = "README.md"
+keywords = ["splunk", "dfir", "soc", "spl", "llm", "prompt-injection"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Information Technology",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.11", "types-requests"]
+# Only needed for SOC_LLM_BACKEND=anthropic. The Ollama backend uses `requests`,
+# which is already a core dependency, so the air-gapped path needs no extras.
+anthropic = ["anthropic"]
+
+[project.scripts]
+soc-copilot = "soc_copilot.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["soc_copilot", "soc_copilot.llm"]
+
+[tool.setuptools.package-data]
+# The curated SPL library ships with the package; generation is grounded on it.
+soc_copilot = ["spl_library.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+# ---------------------------------------------------------------------------
+# Lint
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "F",    # pyflakes
+    "E", "W",  # pycodestyle
+    "I",    # import order
+    "N",    # naming
+    "UP",   # pyupgrade
+    "ANN",  # missing annotations — CLAUDE.md says typed, so hold it to that
+    "S",    # flake8-bandit
+    "B",    # bugbear
+    "A",    # shadowed builtins
+    "C4",   # comprehensions
+    "DTZ",  # naive datetimes
+    "PIE",
+    "RET",
+    "SIM",
+    "ARG",  # unused arguments
+    "PTH",
+    "RUF",
+]
+ignore = [
+    # The exception messages in this project are the product: they tell an
+    # analyst which token expired and where to regenerate it. These three rules
+    # exist to keep messages short and out of the raise site, which is the
+    # opposite of what this codebase is for.
+    "TRY003", "EM101", "EM102",
+    # `Any` is the honest annotation for a decoded JSON payload whose shape is
+    # whatever Splunk sent.
+    "ANN401",
+    # Long strings are wrapped across lines inside lists on purpose. Every hit
+    # is deliberate prose, not a forgotten comma.
+    "ISC004",
+    # Large word sets are written as `"""word word ...""".split()`. The literal
+    # form the rule wants would be ~70 quoted strings and much harder to read.
+    "SIM905",
+    # `ReadOnlyViolation`, `LLMNotConfigured` and `LLMUnavailable` are named for
+    # what they mean. An `Error` suffix would not make them clearer.
+    "N818",
+    # Asserts here narrow a type for the checker after a guard has already run,
+    # and the test suite is built out of them.
+    "S101",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# `ENV_TOKEN = "SPLUNK_TOKEN"` is the *name* of a variable, not a password.
+"soc_copilot/config.py" = ["S105"]
+# One line is a single SPL query inside a TOML fixture; breaking it would change
+# the query under test.
+"tests/test_library.py" = ["E501"]
+# Tests take pytest fixtures by name, and a fixture requested only for its side
+# effect (a running server) is unused by design. Annotating either would add
+# noise without adding a guarantee — the source is where types have to hold.
+"tests/*" = ["ANN", "ARG", "S"]
+
+[tool.ruff.lint.flake8-annotations]
+# Test functions are self-describing; annotating every `-> None` adds noise.
+suppress-none-returning = true
+
+# ---------------------------------------------------------------------------
+# Types
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+files = ["soc_copilot"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unreachable = true
+no_implicit_optional = true
+strict_equality = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+# The SDK is an optional extra, so CI type-checks without it installed.
+module = ["anthropic.*"]
+ignore_missing_imports = true

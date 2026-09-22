@@ -1,0 +1,4 @@
+# Normalise to LF in the repository. The lab runs on Windows and CI runs on
+# both, so without this every file churns its line endings on the first commit
+# from the other platform.
+* text=auto eol=lf

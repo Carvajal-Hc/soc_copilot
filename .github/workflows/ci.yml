@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: py${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The lab runs on Windows and the CLI prints tables to a Windows
+        # console, so Windows is not an afterthought here. Linux is in the
+        # matrix because that is where anyone else will first run this.
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Types
+        run: mypy
+
+      - name: Tests
+        # The suite never reaches Splunk or an LLM: every backend and client is
+        # scripted in tests/conftest.py. No secret is needed, and none is
+        # available to this job.
+        run: pytest
+
+  no-secrets:
+    name: no secrets committed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: A real .env must never be tracked
+        # .gitignore is the intent; this is the check. A template with blank
+        # values is fine and is the only .env-shaped file allowed in the tree.
+        run: |
+          if git ls-files --error-unmatch .env >/dev/null 2>&1; then
+            echo "::error::.env is tracked by git. Remove it from the index and rotate the token."
+            exit 1
+          fi
+          echo "ok: no tracked .env"
+
+      - name: The template must stay blank
+        run: |
+          if grep -nE '^[A-Z_]+=.+' .env.example; then
+            echo "::error::.env.example has a non-empty value. It is a template; values stay blank."
+            exit 1
+          fi
+          echo "ok: .env.example carries no values"

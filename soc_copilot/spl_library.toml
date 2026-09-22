@@ -1,0 +1,893 @@
+#  SOC Copilot — curated SPL library
+#  ============================================================================
+#
+#  This file grounds NL->SPL generation. The generator does not improvise from
+#  zero: it retrieves the entries closest to the analyst's question and adapts
+#  their *pattern* to whatever schema Stage 1 discovered at runtime.
+#
+#  HOW THIS FILE WAS BUILT (provenance matters — read it):
+#    * The payload-extraction machinery (spath + mvfind/mvindex, the rex
+#      fallback, the PayloadDataN caution) was VERIFIED against the live
+#      logforge instance in an earlier session. Those entries are trustworthy.
+#    * The detection *content* (which attacks, which Event IDs, which fields)
+#      comes from the analyst's own cheatsheets (Detecting Windows Attacks with
+#      Splunk; sysmon-event-ids / Unit42; malware analysis). Source of truth is
+#      the analyst's material, not a model's memory.
+#    * Entries added from the cheatsheets but NOT YET run against logforge are
+#      marked  # UNVERIFIED — validate against logforge  in their `teaches`
+#      block. Run each through the validator; keep the ones that fire, revisit
+#      the ones that return zero (wrong Event ID? wrong extraction? not in this
+#      dataset?). This is the Stage-2 verify step and the analyst's own rule #7.
+#
+#  READING RULES FOR THE GENERATOR:
+#    * `pattern` and `teaches` are the point. They carry the SPL technique.
+#    * Field names in `spl` are ILLUSTRATIVE, NOT authoritative. The authoritative
+#      field list is the schema discovered from the live index at query time. If a
+#      name below is not in that discovered schema, the generator must not use it.
+#    * `{index}` is substituted with the target index at load time.
+#    * ALWAYS WRITE `sort 0`, NEVER A BARE `sort`. A bare `| sort - count`
+#      silently caps the result at 10,000 rows — no error, no warning, no
+#      indication in the output that anything was dropped. Measured on this
+#      index: file-drops-eid11 has 10,423 groups and the bare form returned
+#      exactly 10,000. `sort 0` means "no limit". This matters most in the
+#      queries where it is easiest to miss: the rows discarded are the ones
+#      ranked last, so a descending sort loses the rarest values — which in
+#      stack-counting and least-frequent-occurrence hunting IS the lead. Every
+#      `sort` in this file is `sort 0` for that reason. If a result set really
+#      should be capped, cap it explicitly with `| head N` so the cut is
+#      visible in the query rather than implied by a default.
+#
+#  SCOPE OF THIS DATASET (logforge, re-confirmed 2026-08-23):
+#    * THREE artifacts now share sourcetype=csv, told apart only by `source`:
+#        logforge_evtx.csv  120,264  Sysmon; values nested inside Payload
+#        logforge_mft.csv   163,385  MFT; FLAT fields, no Payload
+#        logforge_pf.csv        172  Prefetch; FLAT fields, no Payload
+#      sourcetype=csv therefore scopes NOTHING. See pick-the-source-for-the-question.
+#    * This supersedes an earlier note here that said MFT and Prefetch were not
+#      ingested and their questions could not be answered. They are, and they can.
+#    * The MFT export holds file METADATA only. File CONTENT is still out of
+#      scope for this index — that is raw-artifact work on $MFT itself.
+#    * CORRECTED 2026-08-23: the evtx export is NOT Sysmon-only. Channel="Security"
+#      IS present, carrying 4624 and other Security events. An earlier note here
+#      said there was no Security channel and that 4624/4648/4769 detections would
+#      return zero; that was wrong, and it was wrong in the expensive direction —
+#      it would have had the tool decline questions the data can answer. Security
+#      detections shelved on the strength of that note are worth revisiting.
+
+version = 1
+name = "logforge-sysmon"
+description = "Sysmon EVTX detections for the logforge index: flat filtering, payload extraction, statistical outliers."
+
+# ===========================================================================
+# FLAT FILTERING — the value lives in a top-level column. Filter it directly.
+# ===========================================================================
+
+[[detection]]
+id = "event-volume-by-type"
+title = "Event volume by channel and event id"
+attack = "Triage / orientation"
+pattern = "flat-filter"
+question_examples = [
+  "what kinds of events are in the index",
+  "how many events per channel",
+  "what event ids are present",
+]
+teaches = """
+Orientation query. Channel, EventId and Computer are top-level columns, so they
+are filtered and grouped directly — no extraction. Reach for this shape whenever
+the question only involves flat fields. This is also the first thing to run on an
+unfamiliar index to see its shape.
+"""
+spl = '''
+index={index}
+| stats count by Channel, EventId
+| sort 0 - count
+'''
+
+[[detection]]
+id = "process-creation-volume"
+title = "Process-creation events per host"
+attack = "Execution / T1059"
+pattern = "flat-filter"
+question_examples = [
+  "how many processes were created",
+  "which hosts ran the most processes",
+  "process creation count by computer",
+]
+teaches = """
+Selecting one event type is a flat filter on two flat fields. Note that the
+event-type selector (Channel + EventId) is ALWAYS flat, even when everything you
+want to report about that event lives nested inside the payload.
+"""
+spl = '''
+index={index} Channel="Microsoft-Windows-Sysmon/Operational" EventId=1
+| stats count by Computer
+| sort 0 - count
+'''
+
+# ===========================================================================
+# PAYLOAD EXTRACTION — the value lives INSIDE the structured payload field.
+# Filtering it as if it were flat silently returns nothing. (VERIFIED machinery)
+# ===========================================================================
+
+[[detection]]
+id = "payload-extract-canonical"
+title = "Extract named values from a name/value payload array"
+attack = "Technique / any nested field"
+pattern = "payload-extract"
+question_examples = [
+  "command lines",
+  "what commands were run",
+  "show me the image and command line",
+  "parent process",
+]
+teaches = """
+THE CORE PATTERN. When the payload is JSON shaped as a name/value array —
+{"EventData":{"Data":[{"@Name":"Image","#text":"C:\\..."}, ...]}} — `spath` does
+NOT produce one field per name. It produces two PARALLEL MULTIVALUE ARRAYS:
+`EventData.Data{}.@Name` and `EventData.Data{}.#text`.
+
+So `spath ... path=EventData.Data.Image` yields nothing, and neither does the
+`{@Name="Image"}` predicate form (unsupported on this Splunk build — verified).
+
+Pair the arrays positionally instead: mvfind() locates the index of the wanted
+name, mvindex() reads the value at that index. One eval per field you need.
+Anchor the mvfind regex with ^...$ or "ProcessId" will match "ParentProcessId".
+"""
+spl = '''
+index={index} Channel="Microsoft-Windows-Sysmon/Operational" EventId=1
+| spath input=Payload
+| eval Image       = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^Image$"))
+| eval CommandLine = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^CommandLine$"))
+| eval ParentImage = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^ParentImage$"))
+| stats count by Image, ParentImage
+| sort 0 - count
+'''
+
+[[detection]]
+id = "payload-extract-then-filter"
+title = "Filter on a nested value (extract first, then where)"
+attack = "Execution / T1059.001"
+pattern = "payload-extract"
+question_examples = [
+  "did powershell run with encoded commands",
+  "find command lines containing a string",
+  "which processes ran from the temp directory",
+]
+teaches = """
+# VERIFIED against logforge 2026-08-22 — validator ACCEPTED, 0 rows: a LEGITIMATE
+# zero, not a broken query. The extraction was checked separately with the -enc
+# filter removed: 812 EID 1 events all have CommandLine populated (0 null/empty),
+# 6 of them PowerShell, and none contain "-enc". There is no encoded PowerShell
+# in this capture. The mechanism works; the technique is simply absent here.
+A nested value cannot appear in the base search — the base search only sees flat
+fields. Narrow on flat fields first (cheap, uses the index), THEN extract, THEN
+filter the extracted field with `where`/`search`.
+
+Ordering matters for cost: never extract across the whole index and filter after.
+
+Zero rows from a query like this is ambiguous and must be resolved before it is
+reported: it means either "the technique did not occur" or "the filter is wrong".
+Tell them apart by removing the filter and listing the real values of the field —
+never by adjusting the filter until something matches.
+"""
+spl = '''
+index={index} Channel="Microsoft-Windows-Sysmon/Operational" EventId=1
+| spath input=Payload
+| eval CommandLine = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^CommandLine$"))
+| eval Image       = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^Image$"))
+| where match(CommandLine, "(?i)-enc(odedcommand)?\\s")
+| table _time, Computer, Image, CommandLine
+| sort 0 - _time
+'''
+
+[[detection]]
+id = "payload-pivot-processguid"
+title = "Pivot on a nested correlation key (ProcessGuid)"
+attack = "Execution / process lineage"
+pattern = "pivot"
+question_examples = [
+  "what did that process do",
+  "pivot by processguid",
+  "correlate network connections to the process that made them",
+  "process lineage",
+]
+teaches = """
+The correlation key itself is nested. `... | stats count by ProcessGuid` against
+the raw events returns NOTHING, because ProcessGuid is not a column — it is a
+name inside the payload array. This is the analyst's rule "pivot on a unique
+identifier, not a category" — ProcessGuid over Image.
+
+Extract it on BOTH sides of the pivot, then group. Here process creations (EID 1)
+and network connections (EID 3) are joined on the extracted ProcessGuid using
+stats rather than `join` — stats is the cheaper and more reliable correlation in
+SPL.
+"""
+spl = '''
+index={index} Channel="Microsoft-Windows-Sysmon/Operational" (EventId=1 OR EventId=3)
+| spath input=Payload
+| eval ProcessGuid     = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^ProcessGuid$"))
+| eval Image           = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^Image$"))
+| eval DestinationIp   = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^DestinationIp$"))
+| eval DestinationPort = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^DestinationPort$"))
+| stats values(Image) as Image,
+        dc(DestinationIp) as distinct_destinations,
+        values(DestinationIp) as destinations,
+        values(DestinationPort) as ports,
+        count
+    by ProcessGuid
+| sort 0 - distinct_destinations
+'''
+
+[[detection]]
+id = "payload-extract-hashes"
+title = "Split a packed nested value (Sysmon Hashes)"
+attack = "Defense Evasion / file identification"
+pattern = "payload-extract"
+question_examples = [
+  "what is the sha256 of that binary",
+  "hashes of executed files",
+  "md5 of the process",
+]
+teaches = """
+Some nested values are themselves packed key=value strings, e.g.
+"SHA1=...,MD5=...,SHA256=...,IMPHASH=...". Extract the nested field first, then
+`rex` the packed string into its parts. Two stages, not one.
+"""
+spl = '''
+index={index} Channel="Microsoft-Windows-Sysmon/Operational" EventId=1
+| spath input=Payload
+| eval Image  = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^Image$"))
+| eval Hashes = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^Hashes$"))
+| rex field=Hashes "SHA256=(?<SHA256>[0-9A-Fa-f]+)"
+| rex field=Hashes "MD5=(?<MD5>[0-9A-Fa-f]+)"
+| stats count by Image, SHA256, MD5
+'''
+
+[[detection]]
+id = "payload-extract-all-names"
+title = "Explode every nested name/value pair (exploratory)"
+attack = "Triage / unknown event type"
+pattern = "payload-extract"
+question_examples = [
+  "what fields does this event type have",
+  "show everything in the payload",
+  "what is inside the payload",
+]
+teaches = """
+Exploratory only. When you do not yet know which nested names an event type
+carries, zip the two parallel arrays and expand them. This explodes one event
+into one row per nested pair, so ALWAYS narrow hard on flat fields first and cap
+with `head`. Do not use this shape for counting — the row multiplication will
+distort every aggregate.
+"""
+spl = '''
+index={index} Channel="Microsoft-Windows-Sysmon/Operational" EventId=11
+| head 200
+| spath input=Payload
+| eval pair = mvzip('EventData.Data{}.@Name', 'EventData.Data{}.#text', "=")
+| mvexpand pair
+| rex field=pair "^(?<nested_name>[^=]+)=(?<nested_value>.*)$"
+| stats count by nested_name
+| sort 0 - count
+'''
+
+[[detection]]
+id = "payload-rex-fallback"
+title = "Fallback: regex straight at the payload text"
+attack = "Technique / any nested field"
+pattern = "payload-extract"
+question_examples = [
+  "extract a value without spath",
+  "regex the payload",
+]
+teaches = """
+# VERIFIED against logforge 2026-08-22 — validator ACCEPTED, 89 rows returned
+# (same 89 distinct images the spath form yields, confirming the two extraction
+# routes agree once escaping is normalised).
+FALLBACK ONLY — prefer the spath + mvfind/mvindex pattern.
+
+`rex` against the raw payload text works and is cheap, but it returns the value
+with its JSON escaping still in place: a path comes back as
+"C:\\\\Users\\\\user\\\\x.exe" (doubled backslashes), whereas spath decodes it to
+"C:\\Users\\user\\x.exe". Verified on live data. Use rex only when the payload is
+not valid parseable JSON, and expect to normalise escapes afterwards — the
+`replace` below is what collapses the doubled backslashes.
+
+ESCAPING, EXACTLY. This `spl` block is a TOML literal string ('''), so what is
+written here reaches Splunk verbatim — TOML does no escape processing. Inside a
+double-quoted SPL string a quote is therefore `\\"` (ONE backslash). Writing
+`\\\\"` sends an escaped backslash followed by an unescaped quote, which closes
+the string early: Splunk rejects the whole search with "Missing a search command
+before '^'". That was a real bug in this entry, caught by running it.
+
+The `replace` args are different and are NOT a typo: its first argument is a
+regex, so matching two literal backslashes needs four in the regex and eight in
+the SPL source, and emitting one needs two in the source.
+"""
+spl = '''
+index={index} Channel="Microsoft-Windows-Sysmon/Operational" EventId=1
+| rex field=Payload "\"@Name\":\"Image\",\"#text\":\"(?<Image>[^\"]*)\""
+| eval Image = replace(Image, "\\\\\\\\", "\\\\")
+| stats count by Image
+| sort 0 - count
+'''
+
+# ===========================================================================
+# SYSMON ATTACK DETECTIONS — from the analyst's cheatsheets (Unit42 / malware).
+# EID 10 confirmed present in logforge (2,968 events). The rest UNVERIFIED.
+# ===========================================================================
+
+[[detection]]
+id = "lsass-dump-eid10"
+title = "LSASS credential dump (Sysmon ProcessAccess)"
+attack = "Credential Access / T1003.001"
+pattern = "payload-extract"
+question_examples = [
+  "did anything dump lsass",
+  "credential dumping",
+  "who accessed lsass",
+  "processaccess to lsass",
+]
+teaches = """
+# VERIFIED against logforge 2026-08-22 — validator ACCEPTED, 7 rows returned
+# (68 lsass-targeting accesses out of 2,968 EID 10 events; rarest row is
+# Process Hacker at 0x1010, commonest is msiexec at 0x1FFFFF).
+EID 10 is ProcessAccess. TargetImage, GrantedAccess, SourceImage and CallTrace
+all live nested in the payload, so extract before filtering. SourceImage is the
+accessing process — the thing you are actually trying to attribute.
+
+THE 0x1FFFFF SIGNATURE IS MOSTLY NOISE — THIS ENTRY DELIBERATELY DOES NOT USE IT.
+The cheatsheet signature is "access to lsass.exe with GrantedAccess 0x1FFFFF
+(full rights)". Measured against real data, that filter is close to useless here:
+of the 68 accesses to lsass.exe, 66 carry 0x1FFFFF and almost all are ordinary
+system behaviour — msiexec (34), csrss (10), wininit (10), Sysmon64 (8). The one
+row a hunter actually wants is Process Hacker 2 at 0x1010 — and the 0x1FFFFF
+filter was hiding exactly that row, reporting nothing while a credential-access
+tool sat in the data.
+
+So: surface ALL access to lsass and let the distribution speak. Group by
+SourceImage and GrantedAccess and sort ASCENDING, so the rare tool/mask pair
+rises to the top. The anomaly was in the RARE mask, not the full-access one —
+which is rule #1 again: the signal is in the distribution, not the volume, and a
+signature borrowed from training material is a hypothesis to test against real
+data, not a fact to filter on.
+
+CASE-SENSITIVITY BIT US HERE. This entry previously filtered
+GrantedAccess="0x1fffff" and returned zero rows for months of reading, because
+the data is uppercase 0x1FFFFF and `=` inside `where` is case-sensitive. If you
+ever do need to pin a mask, write it case-insensitively:
+    | where match(GrantedAccess, "(?i)^0x1fffff$")
+Same for paths: `match(TargetImage, "(?i)lsass\\.exe$")` rather than a
+case-sensitive `like`, since Windows paths vary in casing event to event
+(here: "C:\\Windows\\system32\\lsass.exe", lowercase system32).
+"""
+spl = '''
+index={index} Channel="Microsoft-Windows-Sysmon/Operational" EventId=10
+| spath input=Payload
+| eval TargetImage    = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^TargetImage$"))
+| eval SourceImage    = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^SourceImage$"))
+| eval GrantedAccess  = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^GrantedAccess$"))
+| eval CallTrace      = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^CallTrace$"))
+| where match(TargetImage, "(?i)lsass\.exe$")
+| stats count values(Computer) as hosts by SourceImage, GrantedAccess
+| sort 0 count
+'''
+
+[[detection]]
+id = "network-c2-eid3"
+title = "Network connections for C2 / beaconing triage (Sysmon EID 3)"
+attack = "Command and Control / T1071"
+pattern = "payload-extract"
+question_examples = [
+  "outbound network connections",
+  "what did this process connect to",
+  "possible c2",
+  "connections by destination",
+]
+teaches = """
+# VERIFIED against logforge 2026-08-21 — validator ACCEPTED, 17 rows returned
+# (17 distinct processes; chrome.exe dominates at 124 connections / 14 distinct
+# destinations, with a browser-heavy tail — no beaconing signature in this data).
+EID 3 is network connection. DestinationIp / DestinationPort / Image are nested.
+From the analyst's cheatsheet, C2 shows as a process making repeated outbound
+connections; pivoting by the source process (via ProcessGuid) surfaces which
+binary is talking out. Use the ProcessGuid pivot pattern for attribution; this
+entry is the simpler destination rollup.
+"""
+spl = '''
+index={index} Channel="Microsoft-Windows-Sysmon/Operational" EventId=3
+| spath input=Payload
+| eval Image           = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^Image$"))
+| eval DestinationIp   = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^DestinationIp$"))
+| eval DestinationPort = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^DestinationPort$"))
+| stats count dc(DestinationIp) as distinct_dst by Image
+| sort 0 - count
+'''
+
+[[detection]]
+id = "dns-rare-domain-eid22"
+title = "DNS queries to rare domains (Sysmon EID 22)"
+attack = "Command and Control / Exfiltration / T1071.004"
+pattern = "payload-extract"
+question_examples = [
+  "dns queries",
+  "suspicious domains",
+  "dns to rare domains",
+  "possible dns exfiltration",
+]
+teaches = """
+# VERIFIED against logforge 2026-08-21 — validator ACCEPTED, 44 rows returned
+# (EID 22 confirmed present; a flat low-volume tail — every domain queried
+# exactly twice by a single process, so ranking is by rarity of domain, not
+# by frequency spread).
+EID 22 is DNS query. QueryName and Image are nested. The analyst's rule: the
+anomaly is in the distribution — a domain queried by very few processes/hosts,
+or long random subdomains, stands out against the background. Extract QueryName,
+then count by it and look at the low-frequency tail (least common, not most).
+"""
+spl = '''
+index={index} Channel="Microsoft-Windows-Sysmon/Operational" EventId=22
+| spath input=Payload
+| eval QueryName = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^QueryName$"))
+| eval Image     = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^Image$"))
+| stats count dc(Image) as distinct_procs by QueryName
+| sort 0 count
+'''
+
+[[detection]]
+id = "file-drops-eid11"
+title = "File creations / drops on disk (Sysmon EID 11)"
+attack = "Execution / Persistence / T1105"
+pattern = "payload-extract"
+question_examples = [
+  "files created on disk",
+  "what was dropped",
+  "file drops in temp",
+  "new executables written",
+]
+teaches = """
+# VERIFIED against logforge 2026-08-21 — validator ACCEPTED, 10,423 rows returned
+# (25,402 EID 11 events; a long flat tail, almost all .NET NativeImages and
+# sppsvc temp files — high-volume background noise, so filter before reading).
+EID 11 is FileCreate. TargetFilename and Image are nested. Useful for spotting
+drops into suspicious locations (temp, downloads, startup). Extract TargetFilename,
+then filter on the path of interest. Pair with EID 1 by ProcessGuid to tie a drop
+to the process that made it.
+
+`sort 0` IS DELIBERATE — DO NOT DROP THE 0. Bare `| sort 0 - count` silently caps
+at 10,000 rows. Verified here: this query has 10,423 groups, and the bare form
+returned exactly 10,000 with no error and no warning. The missing 423 are the
+LEAST frequent groups, which in a file-drop hunt is precisely where the lead
+lives. `sort 0` means "no limit". Any stacking query whose group count might
+exceed 10,000 needs it — and on a noisy event type like this one, it will.
+"""
+spl = '''
+index={index} Channel="Microsoft-Windows-Sysmon/Operational" EventId=11
+| spath input=Payload
+| eval TargetFilename = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^TargetFilename$"))
+| eval Image          = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^Image$"))
+| stats count by Image, TargetFilename, Computer
+| sort 0 - count
+'''
+
+# ===========================================================================
+# STATISTICAL / STACK-COUNTING TEMPLATES — the analyst's methodology.
+# Source-agnostic shapes: "the anomaly is in the distribution, not the volume."
+# ===========================================================================
+
+[[detection]]
+id = "statistical-outlier"
+title = "Statistical outlier by any grouping field"
+attack = "Anomaly detection / methodology"
+pattern = "payload-extract"
+question_examples = [
+  "what is unusual",
+  "find outliers",
+  "which host is anomalous",
+  "statistically rare activity",
+]
+teaches = """
+# VERIFIED against logforge 2026-08-21 — validator ACCEPTED, 5 rows returned
+# (89 distinct images, mean 9.12 executions; top outlier cmd.exe at N=72).
+The analyst's outlier template: count per group, then flag groups more than two
+standard deviations above the mean. This encodes rule #1 — the anomaly is in the
+distribution, not the raw volume.
+
+CHOOSING THE GROUPING FIELD IS THE WHOLE TRICK. The measure is a standard
+deviation across groups, so it needs a field with MANY groups. Grouping by a
+flat field with one value — this index has a single host — leaves exactly one
+group, and then stdev collapses to 0 (measured, not null), so the test becomes
+`N > N + 0`, which is never true. Zero rows, for a reason that has nothing to do
+with the technique, and indistinguishable from "no anomaly found".
+
+So group by something with a real distribution. Image (the executable path) is
+nested, so extract it first: the grouping field of an outlier query is often a
+nested value, and extraction comes before the stats. Swap Image for another
+extracted name (ParentImage, TargetFilename, DestinationIp) to ask the same
+question about a different population.
+"""
+spl = '''
+index={index} Channel="Microsoft-Windows-Sysmon/Operational" EventId=1
+| spath input=Payload
+| eval Image = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^Image$"))
+| stats count as N by Image
+| eventstats avg(N) as avg_n stdev(N) as sd_n
+| eval isOutlier = if(N > avg_n + (2 * sd_n), 1, 0)
+| where isOutlier = 1
+| sort 0 - N
+'''
+
+[[detection]]
+id = "stack-counting-lfo"
+title = "Stack counting / least-frequent-occurrence (find the rare thing)"
+attack = "Hunting / methodology"
+pattern = "payload-extract"
+question_examples = [
+  "find the rarest command lines",
+  "least common processes",
+  "what happened only once",
+  "stack the command lines",
+]
+teaches = """
+# VERIFIED against logforge 2026-08-21 — validator ACCEPTED, 227 rows returned
+# (rarest command lines at count=2).
+Least-frequent-occurrence hunting: when you don't know what you're looking for,
+count by the field and sort ASCENDING — the rare, isolated value at the top is
+the lead. Rule #1 in action: "4 events on 1 host beat 70 on 3." Here the value
+(CommandLine) is nested, so extract before stacking. Keep the host list so a rare
+line tied to a single host is obvious.
+"""
+spl = '''
+index={index} Channel="Microsoft-Windows-Sysmon/Operational" EventId=1
+| spath input=Payload
+| eval CommandLine = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^CommandLine$"))
+| stats count values(Computer) as hosts min(_time) as first_seen by CommandLine
+| sort 0 count
+'''
+
+# ===========================================================================
+# SPLIT / POSITIONAL FIELDS — present, but not a substitute for extraction.
+# ===========================================================================
+
+[[detection]]
+id = "split-fields-caution"
+title = "Positional split fields (PayloadDataN) — read before using"
+attack = "Triage / orientation"
+pattern = "flat-filter"
+question_examples = [
+  "what is in payloaddata1",
+  "use the payloaddata fields",
+]
+teaches = """
+Exports often flatten part of the payload into a numbered family
+(PayloadData1..N). These ARE flat columns, so they filter directly and cheaply.
+
+But their meaning is POSITIONAL AND VARIES BY EVENT TYPE: for a Sysmon
+process-create PayloadData1 holds "ProcessID: 1632, ProcessGUID: ..." while for
+another event id the same column holds something unrelated. They are also often
+truncated and label-prefixed.
+
+Use them for a cheap pre-filter or a quick eyeball. NEVER report a value from
+them as if it were a named field, and never group by them across mixed event
+types. Extract from the payload for anything authoritative.
+"""
+spl = '''
+index={index} Channel="Microsoft-Windows-Sysmon/Operational" EventId=1
+| table _time, Computer, PayloadData1, PayloadData4
+| head 20
+'''
+
+# ===========================================================================
+# NOT IN THIS DATASET — kept as templates for when other sources are ingested.
+# ===========================================================================
+#
+#  These are real detections from the analyst's "Detecting Windows Attacks with
+#  Splunk" cheatsheet, but they target the Windows SECURITY channel, which is not
+#  present in logforge (Sysmon only). They will return zero here. Uncomment and
+#  validate only after ingesting Security logs.
+#
+#  [[detection]]
+#  id = "failed-logons-security"          # Security 4625 — password spraying / brute force
+#  id = "kerberoasting-4769"              # Security 4769 + EncryptionType 0x17
+#  id = "asrep-roasting-4768"            # Security 4768 + Pre-Auth Type 0
+#  id = "dcsync-4662"                    # Security 4662 + Access Mask 0x100 + repl GUID, origin != DC
+#  id = "pth-tripartite-seclogo"        # PtH tripartite signature (seclogo)
+#  id = "golden-ticket-closed-txn"      # PtT / Golden — transaction closed_txn=0 (NOT with All time)
+#  id = "silver-ticket-4648"            # Silver — 4648 Additional Info
+#  id = "zerologon-netlogon-rpc"        # netlogon RPC count > 100
+
+[[detection]]
+id = "two-step-pivot-processguid"
+title = "Two-step pivot: find a process, then follow that exact process"
+attack = "Triage methodology / execution follow-through"
+pattern = "payload-extract"
+question_examples = [
+  "what did that process do next",
+  "find the powershell execution then show what files it created",
+  "which files did that process write",
+  "what network connections did that process make",
+  "show me everything that same process did",
+]
+teaches = """
+THIS ENTRY IS A PROCEDURE, NOT ONE QUERY. It is two searches, run in two separate
+turns, and it is the shape to use whenever a question links one event to what the
+SAME process did afterwards.
+
+Step 1 finds the process and returns its ProcessGuid. You then READ the
+ProcessGuid out of the returned row and paste that exact value into step 2's
+filter. Step 2 cannot be written before step 1 has run, because the value does
+not exist until then. Run step 1, look at the rows, then write step 2.
+
+Two rules that decide whether this works:
+
+  * Copy the ProcessGuid character for character from a row you were shown. Never
+    write a placeholder such as <value> or <ProcessGuid> — that matches nothing.
+    Never invent or complete a GUID from memory.
+  * Image holds a FULL PATH like C:\\Windows\\System32\\...\\name.exe, so match it
+    with a trailing-wildcard LIKE, not equality. An exact match on the bare file
+    name returns zero rows.
+  * The image name in step 1 is an EXAMPLE of the shape, not a value to reuse.
+    Substitute the name the analyst's question actually gives you. Copying it
+    verbatim asks the index about a process nobody asked about.
+
+Pivoting on ProcessGuid is what makes this triage rather than browsing: it
+follows one specific process. Filtering the second search by Image instead would
+answer a different, vaguer question — "what did anything with that name do" —
+and is the most common way to get this wrong.
+"""
+spl = '''
+```STEP 1 - find the process and get its ProcessGuid. Run this first.```
+index={index} Channel="Microsoft-Windows-Sysmon/Operational" EventId=1
+| spath input=Payload
+| eval ProcessGuid = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^ProcessGuid$"))
+| eval Image       = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^Image$"))
+| search Image="*\\powershell.exe"
+| table _time, Computer, ProcessGuid, Image
+
+```STEP 2 - a SEPARATE search, in the NEXT turn. Replace the GUID below with the```
+```one step 1 actually returned, copied exactly from the row you were shown.```
+index={index} Channel="Microsoft-Windows-Sysmon/Operational" EventId=11
+| spath input=Payload
+| eval ProcessGuid    = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^ProcessGuid$"))
+| eval TargetFilename = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^TargetFilename$"))
+| search ProcessGuid="PASTE-THE-GUID-STEP-1-RETURNED"
+| table _time, Computer, ProcessGuid, TargetFilename
+| sort 0 - _time
+'''
+
+# ===========================================================================
+# MULTI-SOURCE ROUTING — this index holds three artifacts under one
+# sourcetype. Choosing the wrong one is the commonest way to get a confident
+# zero. (VERIFIED against logforge 2026-08-23.)
+# ===========================================================================
+
+[[detection]]
+id = "pick-the-source-for-the-question"
+title = "Route the question to the right artifact (evtx / mft / prefetch)"
+attack = "Triage / orientation"
+pattern = "flat-filter"
+question_examples = [
+  "which artifact should I search",
+  "what data sources are in this index",
+  "where do I look for execution evidence",
+  "where do I look for file timestamps",
+]
+teaches = """
+# VERIFIED against logforge 2026-08-23.
+ALL THREE ARTIFACTS SHARE sourcetype=csv. Only `source` tells them apart, so
+`sourcetype=csv` scopes nothing. Pick the source that matches what the question
+is about, and say so in the base search:
+
+  EXECUTION — "when did X run", "how many times", "was X ever executed"
+    source="*logforge_pf.csv"   fields: ExecutableName, LastRun, RunCount,
+                                        PreviousRun0..6, SourceFilename
+    Prefetch is the execution record. 172 rows: one per parsed .pf file.
+
+  FILE EXISTENCE / TIMESTAMPS — "what files were created in", "when was Y
+  written", "does path Z exist", "what has extension .ps1"
+    source="*logforge_mft.csv"  fields: FileName, ParentPath, Extension,
+                                        Created0x10, LastModified0x10,
+                                        LastAccess0x10, FileSize, IsDirectory
+    MFT is FLAT — no Payload, no spath needed. 163,385 rows.
+
+  PROCESS / NETWORK / REGISTRY EVENTS — "what did process X do", "who connected
+  where", "what was the command line"
+    source="*logforge_evtx.csv" Sysmon. Values live INSIDE Payload; use the
+                                spath + mvfind/mvindex extraction pattern.
+
+WHY SCOPING MATTERS MORE THAN IT LOOKS. Every event in this index carries a
+SourceFile path from the collection, and that path contains the collector's own
+name. A bare keyword search for a tool name therefore matches almost the entire
+index — measured: a bare `*kape*` returned 283,539 of 283,821 rows across all
+three sources, because the capture directory is named `..._Kape_Output`.
+Searching a NAMED FIELD inside a SCOPED source is what makes the result mean
+something.
+
+The three artifacts corroborate each other and should be used together: prefetch
+says a program ran, the MFT says its file existed and when, Sysmon says what it
+did. Disagreement between them is a finding, not an error.
+"""
+spl = '''
+index={index}
+| stats count by source
+| sort 0 - count
+'''
+
+[[detection]]
+id = "prefetch-last-execution"
+title = "When was a program last executed, and how often (prefetch)"
+attack = "Execution / T1204"
+pattern = "flat-filter"
+question_examples = [
+  "when was X last executed",
+  "when did X last run",
+  "how many times was X run",
+  "was that tool ever executed on this host",
+  "what was the last run time",
+]
+# A program running and a person signing in are different questions that share
+# the word "last". Measured: without this, a 14B chose this entry for "when was
+# the user's last successful login" three times out of three.
+not_for = ["login", "logon", "log in", "logged in", "sign in", "signed in", "signin"]
+teaches = """
+# VERIFIED against logforge 2026-08-23.
+THIS ENTRY IS ABOUT EXECUTION, NOT LOGON. "When did X run / was X executed /
+how many times" is this entry. "When did the user log in / last login / who
+logged on" is a DIFFERENT question with a different artifact and a different
+event — use successful-interactive-logon-4624 (Security 4624, LogonType 2).
+LastRun here is the last time a PROGRAM ran; it is not a sign-in time, and
+answering a logon question from prefetch reports the wrong thing confidently.
+
+Execution questions go to PREFETCH, not to Sysmon: prefetch survives after the
+process is gone and carries a run count. The fields are flat — no extraction.
+
+SUBSTITUTE THE NAME. The SPL below carries NAME-FROM-THE-QUESTION as a slot, not
+as a value. Running it unchanged is refused before dispatch, because a filter
+holding template text matches nothing and the empty result would read as "this
+program never ran". Put the stem of the name the analyst asked about there.
+
+MATCH THE NAME WITH A WILDCARD, NEVER EXACTLY. This is the important lesson and
+it cost a real zero-row answer to learn. An exact filter on the name an analyst
+remembers assumes the binary is registered under exactly that name, and real
+executables routinely differ by a prefix, a suffix or a build variant:
+
+    ExecutableName="KAPE.EXE"    -> 0 rows      (confident, and wrong)
+    ExecutableName="*KAPE*"      -> 1 row       GKAPE.EXE
+
+The value on disk was GKAPE.EXE — the GUI build of the same tool registers under
+a different name than the CLI build. Nothing about the question hinted at that,
+and no amount of care over case would have found it. Wildcard on the STEM of the
+name, drop the extension, and let the data show you the real value.
+
+CASE IS NOT THE PROBLEM. Prefetch DISPLAYS executables in uppercase, but field
+matching on this instance is case-INSENSITIVE — measured: "gkape.exe",
+"GKAPE.EXE" and "GkApE.eXe" each return the same row. Do not add case handling;
+add wildcards. Reporting the uppercase form back is correct because that is the
+stored value, but it is not what makes the match work.
+
+ONE ROW PER .pf FILE, NOT PER PROGRAM. A program run from two paths has two
+prefetch entries with separate RunCounts, so group or sort rather than assuming
+a single row. LastRun is the most recent execution; PreviousRun0..6 hold up to
+seven earlier ones.
+
+ABSENCE IS NOT PROOF. A program can execute and have no parsed prefetch row —
+prefetch writes lazily, and anything that ran during or after collection may be
+missing. Say "no prefetch record", never "it never ran".
+"""
+spl = '''
+index={index} source="*logforge_pf.csv" ExecutableName="*NAME-FROM-THE-QUESTION*"
+| table ExecutableName, LastRun, RunCount, PreviousRun0, SourceFilename
+| sort 0 - LastRun
+'''
+
+[[detection]]
+id = "mft-files-created-in-path"
+title = "What files were created under a path, and when (MFT)"
+attack = "Impact / Collection / staging"
+pattern = "flat-filter"
+question_examples = [
+  "what files were created in a directory",
+  "what was written to disk under that path",
+  "when was this file created",
+  "what files have extension ps1",
+  "show me files created on a date",
+]
+teaches = """
+# VERIFIED against logforge 2026-08-23.
+File-existence and timestamp questions go to the MFT. Every field is FLAT — this
+source has no Payload and needs no spath, which is the opposite of the Sysmon
+source in the same index. Reaching for the extraction pattern here produces an
+error or an empty column.
+
+  ParentPath   the containing directory, stored relative with a leading dot:
+               ".\\Users\\Public", not "C:\\Users\\Public". Match it with
+               leading and trailing wildcards rather than anchoring on a drive
+               letter, or a correct path will return nothing.
+  FileName     the leaf name only, with extension.
+  Created0x10  $STANDARD_INFORMATION creation time, sub-second precision.
+               LastModified0x10 / LastAccess0x10 are the sibling timestamps.
+  Extension    already parsed out, so filter on it directly instead of
+               wildcarding FileName.
+
+The MFT and Sysmon corroborate each other, and lining them up is worth doing:
+`.\\Users\\Public\\README.txt` has Created0x10 = 2025-08-11 07:31:00.4847267,
+and the Sysmon EID 11 FileCreate for the same path is 07:31:00.485. Two
+independent artifacts, one event. A timestamp present in one and absent in the
+other is worth a second look.
+
+SCOPE OF THIS SOURCE. The MFT export carries file METADATA only — names, paths,
+timestamps, sizes, flags. It does NOT carry file CONTENT. A question about what
+a file SAYS is not answerable from this index at all; that is raw-artifact work
+on the $MFT itself, where small files are resident inside their own record.
+"""
+spl = '''
+index={index} source="*logforge_mft.csv" ParentPath="*Users*Public*"
+| table FileName, ParentPath, Extension, FileSize, Created0x10, LastModified0x10
+| sort 0 - Created0x10
+'''
+
+# ===========================================================================
+# WINDOWS SECURITY LOG — 4624 and friends. Present in this index alongside
+# Sysmon; an earlier note in this file claimed otherwise and was wrong.
+# ===========================================================================
+
+[[detection]]
+id = "successful-interactive-logon-4624"
+title = "Successful interactive logon (Windows Security 4624, LogonType 2)"
+attack = "Authentication / logon tracking"
+pattern = "payload-extract"
+question_examples = [
+  "when did the user last log in",
+  "last successful login",
+  "user's most recent logon",
+  "who logged in interactively",
+  "successful logons by user",
+]
+# The converse: a sign-in is not a program execution.
+not_for = ["executed", "execution", "ran", "run", "launched", "prefetch"]
+teaches = """
+# VERIFIED against logforge: returns user 2025-08-11 06:46:52, matching a manual
+# Timeline Explorer analysis of the same evtx.
+THIS ENTRY IS ABOUT LOGON, NOT EXECUTION. "Login / log in / logon / signed in /
+who logged on" is this entry, whatever time words surround it — "last successful
+login" is a LOGON question even though it contains "last". If the question is
+about a PROGRAM running ("when was X executed / last run"), that is
+prefetch-last-execution instead. Two different artifacts, two different events;
+LastRun is not a sign-in.
+
+Successful logons are Security EventId 4624, on Channel="Security". THESE ARE IN
+THIS INDEX, alongside Sysmon — the evtx export is not Sysmon-only, and an earlier
+scope note in this file asserted the opposite. If a Security-log question ever
+looks unanswerable, check the data before believing the label.
+
+LogonType and TargetUserName are nested inside Payload, so extract them with the
+usual spath + mvfind/mvindex pairing before filtering. The event-type selector
+(Channel + EventId) is flat, as always.
+
+FILTER ON LogonType=2 FOR "WHO LOGGED IN" QUESTIONS. This is the part that
+decides whether the answer is useful:
+
+    2  interactive — a human at the console. What "logged in" normally means.
+    3  network     — SMB, remote file access. Not a person sitting down.
+    5  service     — the service control manager starting something.
+    10 remote interactive (RDP), 7 unlock, 11 cached.
+
+Without the LogonType filter the result fills with service and system logons and
+the human logon is buried among them. Excluding machine accounts (names ending in
+$) and SYSTEM removes the rest of the noise.
+
+Prefer `latest(_time)` over sorting raw events when the question is "when LAST" —
+it collapses to one row per user and answers the question directly rather than
+handing back a timeline to read.
+"""
+spl = '''
+index={index} Channel="Security" EventId=4624
+| spath input=Payload
+| eval LogonType      = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^LogonType$"))
+| eval TargetUserName = mvindex('EventData.Data{}.#text', mvfind('EventData.Data{}.@Name', "^TargetUserName$"))
+| where LogonType="2" AND NOT match(TargetUserName, "\\$$") AND TargetUserName!="SYSTEM"
+| stats latest(_time) as last_logon, count by TargetUserName
+| eval last_logon=strftime(last_logon,"%Y-%m-%d %H:%M:%S")
+| sort 0 - last_logon
+'''

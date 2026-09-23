@@ -62,10 +62,16 @@ Never invent Splunk field names or sourcetypes. Read the real schema from the li
 and generate SPL against those exact names.
 
 ## Known lab environment (build against this reality)
-- Index: logforge   |   sourcetype: csv (EvtxECmd export)
+- Index: logforge   |   sourcetype: csv
 - REST management API: https://localhost:8089 (self-signed cert — see Stage 1)
-- Data is historical (around November 2024), ~60,000 events — time ranges must not default
-  to "last 24 hours."
+- Three artifacts share the one index and the one sourcetype, told apart only by `source`:
+    logforge_evtx.csv   120,264   EvtxECmd; Sysmon + Security, values nested inside Payload
+    logforge_mft.csv    163,385   MFTECmd; flat fields, no Payload
+    logforge_pf.csv         172   PECmd;   flat fields, no Payload
+  283,821 events in total.
+- Data is historical: 2021-11-21 to 2025-08-11. Time ranges must not default to "last 24
+  hours." The span is wide because the MFT carries file timestamps far older than the
+  collection; the evtx activity itself is around 2025-08-11.
 - Fields confirmed present from the ingest preview (non-exhaustive; Stage 1 enumerates the
   authoritative full set): _time, Channel, ChunkNumber, Computer, EventId, EventRecordId,
   ExecutableInfo, HiddenRecord, Keywords, Level, MapDescription.

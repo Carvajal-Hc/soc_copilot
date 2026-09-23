@@ -47,10 +47,16 @@ jobs:
         run: mypy
 
       - name: Tests
-        # The suite never reaches Splunk or an LLM: every backend and client is
-        # scripted in tests/conftest.py. No secret is needed, and none is
-        # available to this job.
-        run: pytest
+        # The default suite never reaches Splunk or an LLM: every backend and
+        # client is scripted in tests/conftest.py. No secret is needed, and none
+        # is available to this job.
+        #
+        # The `live` suite is excluded by `addopts = "-m 'not live'"` in
+        # pyproject.toml, and is stated again here so the exclusion does not
+        # depend on a setting someone could change without seeing this job. It
+        # needs a real Splunk holding the demo index; run it locally with
+        # `pytest -m live`.
+        run: pytest -m "not live"
 
   no-secrets:
     name: no secrets committed

@@ -43,7 +43,12 @@ soc_copilot = ["spl_library.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+# `-m "not live"` is what keeps the default run hermetic. The live suite needs a
+# reachable Splunk holding the demo index and is opt-in: `pytest -m live`.
+addopts = "-q -m 'not live'"
+markers = [
+    "live: needs a reachable Splunk with the demo index ingested. Excluded from the default run and from CI; run with `pytest -m live`.",
+]
 
 # ---------------------------------------------------------------------------
 # Lint

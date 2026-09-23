@@ -2,8 +2,13 @@
 
 A natural-language triage assistant over Splunk for DFIR / SOC work. The analyst asks a
 question in plain language; the system translates it to SPL, runs it read-only against a
-local Splunk instance, reads the rows that come back, and answers from those rows — pivoting
-with follow-up searches when the first result hands it an identifier worth chasing.
+local Splunk instance, reads the rows that come back, and answers from those rows.
+
+It can also pivot — take an identifier out of one search's rows and filter the next search on
+it. That is the hardest thing here and it is not the typical case: on a local 14B it completed
+**2 of 3** attempts, and only after the library was given an entry demonstrating the two-turn
+shape; on a 7B it completed **0 of 3**. Single-search questions are reliable on both. See F3
+and F5 in [`NOTES.md`](NOTES.md) for the runs behind those numbers.
 
 Splunk's own AI Assistant already does cloud NL->SPL, so the engineering effort here goes
 where that one cannot follow:
@@ -25,6 +30,31 @@ The stages build on each other:
 | 3 | the tool-using loop: run a search, read the rows, pivot, answer |
 | 4 | the guardrails as hard code, and three renderings of the result |
 
+## What you get depends on which backend you run
+
+This is the trade the pluggable LLM layer exists to hand you, and it is worth understanding
+before anything else, because it decides what the tool can actually answer.
+
+**Local (`ollama`, a 14B) — fully air-gapped, and it leans on the library.** Nothing leaves
+the machine: not the question, not the schema, not a row. The cost is reasoning. A 14B does
+not work out an unfamiliar question from first principles; it adapts the closest example it
+was shown. So its competence is roughly the coverage of
+[`spl_library.toml`](soc_copilot/spl_library.toml). Ask something the library covers and it is
+good. Ask something outside it and the realistic outcomes are a query that runs but answers a
+near-miss question, or an honest "not in this data" — which, when the data is in fact there,
+is the most dangerous failure this system has (F6 in [`NOTES.md`](NOTES.md)). Extending the
+library is the normal way to extend the local path, not a workaround.
+
+**Hosted (`anthropic`) — reasons over questions nobody curated, and your evidence leaves the
+machine.** The question and the discovered schema go to a third party. In return you get a
+model that can compose a query for a question the library never anticipated. If the evidence
+is sensitive or the network is restricted, that is exactly the trade you cannot make, which is
+why the local path exists.
+
+Both paths run through identical guardrails. Read-only enforcement, literal anchoring and the
+untrusted-input envelope are deterministic Python either way; the backend changes what gets
+asked, never what is allowed.
+
 ## Stage 1 — the deterministic Splunk layer
 
 **It contains no LLM code of any kind.** It does three things and nothing else:
@@ -42,7 +72,35 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 ```
 
-Python 3.11+ is required.
+Python 3.11+ is required. Every command below is written as `python -m soc_copilot`, which
+runs from the repository root without installing the package. If you would rather have the
+`soc-copilot` command on your PATH, install the project itself as well:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e .
+```
+
+Then pick a backend — the tool will not generate SPL until you do, and will not pick one for
+you.
+
+**Local, air-gapped.** Install [Ollama](https://ollama.com/download), then pull the model:
+
+```powershell
+ollama pull qwen2.5-coder:14b
+```
+
+The 14B is the one to pull. `qwen2.5-coder:7b` is the code default and it is enough for
+single-search questions, but it did not complete a two-step pivot in any of three attempts —
+see the table under [Choosing a backend](#choosing-a-backend). Ollama must be running when you
+ask a question; the client talks to `http://localhost:11434` unless `OLLAMA_HOST` says
+otherwise.
+
+**Hosted.** The Anthropic SDK is an optional extra, deliberately not in `requirements.txt` so
+the air-gapped path never needs it:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install anthropic
+```
 
 ## Configure
 
@@ -65,6 +123,62 @@ tokenised request with `401 call not properly authenticated`.
 > placed in an LLM prompt or accepted through a chat interface. `SplunkConfig` keeps it out
 > of its `repr()` and out of `describe()` so it cannot leak into logs.
 
+## The dataset this demo runs on
+
+Everything below assumes a Splunk index called `logforge`, and **that index is something you
+have to build** — no data ships with this repository. If you skip this section, `verify`
+connects and every query returns nothing.
+
+The demo data is the **[LogForge](https://app.hackthebox.com/sherlocks) Sherlock from Hack The
+Box** — a Windows host triage collection. Any comparable evidence set works; this one is named
+because it is what every number in `NOTES.md` was measured against.
+
+**Parse the artifacts to CSV** with Eric Zimmerman's tools. Three of them, because the
+questions in the library span three artifacts:
+
+| tool | artifact | output used here |
+| --- | --- | --- |
+| `EvtxECmd` | Windows event logs (Sysmon + Security) | `logforge_evtx.csv` |
+| `MFTECmd` | `$MFT` | `logforge_mft.csv` |
+| `PECmd` | Prefetch | `logforge_pf.csv` |
+
+**Ingest all three into one index named `logforge`, under one sourcetype (`csv`).** Two
+details matter, and both were learned the hard way:
+
+* **Keep the three filenames distinct, and keep them.** One index and one sourcetype means
+  `source` is the *only* thing separating an MFT row from a Sysmon row. Two library entries
+  scope on it directly (`prefetch-last-execution` on `source="*logforge_pf.csv"`,
+  `mft-files-created-in-path` on `*logforge_mft.csv`), the library's header block maps all
+  three filenames to the fields they carry, and `pick-the-source-for-the-question` exists
+  purely to teach the model to route a question to the right artifact. Merge or rename them
+  and that routing stops working. For scale, the reference ingest was 120,264 evtx rows, 163,385 MFT
+  rows and 172 prefetch rows.
+* **`_time` must come from the event, not from ingest time.** The all-time default
+  (`earliest="0"`) exists precisely because this data is historical, but every `stats
+  latest(_time)`, every timeline and every "when did X last run" depends on `_time` being the
+  real timestamp. The catch is that the three CSVs do not share a timestamp column —
+  EvtxECmd's is the event's creation time, MFT rows carry `Created0x10` / `LastModified0x10`,
+  and prefetch carries `LastRun` / `PreviousRun0`. Only the evtx timestamp was verified to
+  land in `_time` in the reference ingest; the MFT and prefetch entries read their time
+  columns as ordinary fields and do not rely on `_time`. If you want a single unified
+  timeline across all three, that is props/transforms work this repository does not do for
+  you.
+
+**Confirm it landed** before asking anything:
+
+```powershell
+.\.venv\Scripts\python.exe -m soc_copilot verify   # known-good search, then the schema
+.\.venv\Scripts\python.exe -m soc_copilot schema   # per-sourcetype counts and the time range
+```
+
+`schema` prints the first and last event time it found. If that range is not what you
+expect, fix the ingest before going further — a wrong `_time` produces queries that run
+cleanly and answer nothing.
+
+**Using a different index name?** Pass `--index yours` to any command. That covers the
+engine, but not the shipped detections — see
+[The curated library](#the-curated-library) for what else has to change.
+
 ## Use
 
 ```powershell
@@ -80,8 +194,9 @@ Common flags: `--index`, `--earliest`, `--latest`, `--limit`, `--include-interna
 **Time range is explicit and all-time by default.** `run_search(spl, earliest, latest)`
 takes the window as first-class parameters. The defaults are `earliest="0"` (epoch 0, no
 lower bound) and `latest=""` (omitted, no upper bound) — deliberately *not* a relative
-default like `-24h`, because the lab data is historical (~November 2024) and a relative
-default would silently return nothing.
+default like `-24h`, because the evidence in an investigation is always historical and a
+relative default would silently return nothing. Run `soc_copilot schema` to see the actual
+range of whatever you ingested; the events cited throughout `NOTES.md` are from 2025-08-11.
 
 **TLS is relaxed for loopback only.** A local Splunk install ships a self-signed
 management certificate. `SplunkConfig` sets `verify_tls=False` **only** when the host
@@ -191,10 +306,29 @@ instead of reading as an outage. See F3 in [`NOTES.md`](NOTES.md).
 
 ### Why it does not just ask the model
 
-Field discovery is dynamic. Nothing is hardcoded for any dataset: the flat field list comes
-from Stage 1 discovery, and the *nested* structure is discovered by sampling real events at
-runtime. On the lab index that finds 50 flat fields and 827 nested names living inside a
-`Payload` column, keyed by event type.
+Field discovery is dynamic. **No field name is hardcoded for any dataset:** the flat field
+list comes from Stage 1 discovery, and the *nested* structure is discovered by sampling real
+events at runtime. On the lab index that finds 50 flat fields and 827 nested names living
+inside a `Payload` column, keyed by event type.
+
+That claim is about *field names*, and it stops there. **The shipped detection library is
+tuned to this dataset and is not portable**, which is a separate thing worth being blunt
+about:
+
+* `schema.py` defaults `--index` to `logforge`.
+* **15 of the 20** entries filter `Channel="Microsoft-Windows-Sysmon/Operational"`. On an
+  index without Sysmon they return zero rows — valid SPL, real fields, nothing found.
+* **2** filter a source filename directly (`source="*logforge_pf.csv"`,
+  `*logforge_mft.csv`), and the library's header block names all three CSVs as the map of
+  which artifact holds which fields.
+* **1** filters `Channel="Security"` for logon events.
+* **2** are artifact-agnostic and would run anywhere (`event-volume-by-type`,
+  `pick-the-source-for-the-question`).
+
+The engine is general; the shipped detections are a starter set for one collection. The
+discovery layer will happily read your schema and the guardrails will happily police your
+queries — but the examples the model adapts from are these, and swapping them is the work
+described next.
 
 That distinction is the whole point. `... | stats count by ProcessGuid` is valid SPL that
 runs cleanly and returns **zero rows**, because `ProcessGuid` is not a column — it is a name
@@ -218,8 +352,24 @@ produces is what works and what the library teaches:
 `soc_copilot/spl_library.toml` holds known-good detections (attack -> canonical SPL). The
 generator retrieves the closest entries and adapts their *pattern*; it does not improvise
 from zero. Retrieval always includes both a flat-filtering and a payload-extraction example,
-so the contrast is always in front of the model. Replace the shipped starter set with your
-own — the loader validates structure and fails closed on a malformed entry.
+so the contrast is always in front of the model.
+
+**On any dataset other than this one, replacing the shipped entries is a prerequisite, not an
+option.** The 20 entries here encode a specific collection: Sysmon channel names, three CSV
+source filenames, the event ids that collection contains. Point the tool at a different index
+and the majority of them match nothing, which on the local backend is the worst case — the
+model has no near example to adapt, so it produces a near-miss query or concludes the data is
+absent. Budget for writing entries against your own data before judging the local path. The
+loader validates structure and fails closed on a malformed entry, so a bad one is a startup
+error rather than a bad answer.
+
+What the shipped set does cover, for calibration: Sysmon event ids 1, 3, 10, 11 and 22;
+Security 4624 (interactive logon only); MFT file-creation by path; prefetch last-execution;
+and several artifact-agnostic methodology entries (stack counting, outliers, payload
+extraction, the two-step pivot). It does **not** cover registry persistence, scheduled tasks,
+service creation, image/driver load, remote thread injection, named pipes, WMI, failed logons,
+log clearing, PowerShell script-block logs, or browser history. Those questions have no
+covering entry today.
 
 The library is a dependency of *behaviour*, not decoration. The same 14B model went from
 never completing a two-step pivot to completing it in two runs of three, on a library change
@@ -506,25 +656,48 @@ produced SPL that was read-only, used real field names, extracted nested fields 
 returned real rows — and grouped by `DestinationIp` when the question was about the
 originating process. Validity is not correctness. The guardrails promise a safe, well-formed,
 traceable query; they do not promise it matches intent, which is why the human view prints
-the SPL and the anchored rows beside the answer. A semantic-output check remains future work.
+the SPL and the anchored rows beside the answer. F1 deferred a semantic-output check as future
+work; **F4 above built it** (`soc_copilot/semantics.py`). It is advisory — it warns, it does
+not block — so the sentence that still holds is the one about validity not being correctness.
 
 ## Tests
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest        # 482 tests
-.\.venv\Scripts\python.exe -m ruff check .  # lint
-.\.venv\Scripts\python.exe -m mypy          # types
+.\.venv\Scripts\python.exe -m pytest         # 482 tests, no Splunk or model needed
+.\.venv\Scripts\python.exe -m ruff check .   # lint
+.\.venv\Scripts\python.exe -m mypy           # types
+.\.venv\Scripts\python.exe -m pytest -m live # 43 more, against a real Splunk
 ```
 
-All three run on every push, across Python 3.11/3.12/3.13 on Linux and Windows
+The first three run on every push, across Python 3.11/3.12/3.13 on Linux and Windows
 ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)). CI also fails the build if a real
 `.env` is ever tracked or if the committed template stops being blank — `.gitignore` states
 the intent, and that job is what enforces it.
 
-The suite never touches a real Splunk instance or a real model. It covers config precedence
-and secret redaction, the loopback-only TLS rule, SPL normalisation, job polling (including
-Splunk's `"0"`/`"1"` string booleans), result paging, the all-time default, and every failure
-mode above.
+The default suite never touches a real Splunk instance or a real model. It covers config
+precedence and secret redaction, the loopback-only TLS rule, SPL normalisation, job polling
+(including Splunk's `"0"`/`"1"` string booleans), result paging, the all-time default, and
+every failure mode above.
+
+**The `live` suite is the one thing those 482 cannot do.** They prove the machinery is
+right — that a mutating command is refused, that a literal is anchored — but none of them
+asks Splunk anything, so none can tell you that `lsass-dump-eid10` still returns rows.
+A library entry rots quietly: Splunk drops support for a predicate form, a re-ingest renames
+a source, an edit leaves a `spath` misaligned. Each of those still parses, still passes every
+guardrail, and returns nothing — and on the local backend "nothing" is what the model turns
+into "that did not happen".
+
+So `pytest -m live` runs all 21 library queries against the index and asserts two things: every
+entry still executes, and every entry that used to return rows still does. Counts are asserted
+as "> 0" rather than as exact numbers, so a re-ingest of the same evidence does not force a
+re-baseline. Three queries are expected to return zero and each carries its reason on record
+(two hold run-time placeholders; `payload-extract-then-filter` finds no encoded PowerShell
+because this capture contains none). If one of those three ever starts returning rows, that
+fails too — a stale explanation is as much drift as a stale query.
+
+It is excluded from the default run and from CI by `addopts = "-m 'not live'"`, and it
+**skips** rather than fails when Splunk is unreachable or the index is missing, so nobody
+without the dataset is blocked. Last full run: 43 passed against 283,821 events.
 
 The Stage 4 guardrails are tested adversarially rather than confirmed on the easy case: 27
 ways of smuggling a mutating command past a naive check - casing, spacing, newlines,

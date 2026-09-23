@@ -155,11 +155,13 @@ question_examples = [
   "which processes ran from the temp directory",
 ]
 teaches = """
-# VERIFIED against logforge 2026-08-22 — validator ACCEPTED, 0 rows: a LEGITIMATE
-# zero, not a broken query. The extraction was checked separately with the -enc
-# filter removed: 812 EID 1 events all have CommandLine populated (0 null/empty),
-# 6 of them PowerShell, and none contain "-enc". There is no encoded PowerShell
-# in this capture. The mechanism works; the technique is simply absent here.
+# VERIFIED against logforge 2026-08-22, re-verified 2026-09-22 — validator
+# ACCEPTED, 0 rows: a LEGITIMATE zero, not a broken query. The extraction was
+# checked separately with the -enc filter removed: 812 EID 1 events all have
+# CommandLine populated (0 null/empty), 8 of them PowerShell, and none match the
+# -enc / -encodedcommand filter below. The PowerShell that is here uses IEX +
+# DownloadString, not an encoded command. There is no encoded PowerShell in this
+# capture. The mechanism works; the technique is simply absent here.
 A nested value cannot appear in the base search — the base search only sees flat
 fields. Narrow on flat fields first (cheap, uses the index), THEN extract, THEN
 filter the extracted field with `where`/`search`.

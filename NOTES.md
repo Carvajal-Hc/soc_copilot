@@ -835,6 +835,157 @@ Sketch for later, when it is picked up:
 Deep technical detail moved out of the README so the README can stay short. The README links
 here; nothing below is repeated there.
 
+### Backend trade-off and limits
+
+The pluggable LLM layer exists to give you this trade-off. Understand it before anything
+else, because it decides what the tool can actually answer.
+
+**Local (`ollama`, a 14B): fully air-gapped, and it leans on the library.** Nothing leaves
+the machine: not the question, not the schema, not a row. The cost is reasoning. A 14B does
+not work out an unfamiliar question from first principles; it adapts the closest example it
+was shown. So its competence is roughly the coverage of
+[`spl_library.toml`](soc_copilot/spl_library.toml). Ask something the library covers and it is
+good. Ask something outside it and the realistic outcomes are a query that runs but answers a
+near-miss question, or an honest "not in this data". When the data is in fact there, that
+second outcome is the most dangerous failure this system has (F6 above).
+Extending the library is the normal way to extend the local path, not a workaround.
+
+**Hosted (`anthropic`): handles questions nobody curated, but your evidence leaves the
+machine.** The question and the discovered schema go to a third party. In return you get a
+model that can compose a query for a question the library never anticipated. If the evidence
+is sensitive or the network is restricted, you cannot make that trade, which is why the local
+path exists.
+
+Both paths run through identical guardrails. Read-only enforcement, literal anchoring and the
+untrusted-input envelope are deterministic Python either way; the backend changes what gets
+asked, never what is allowed.
+
+**What the local path actually costs.** Measured on this lab (16GB, `qwen2.5-coder`):
+
+| | 7B | 14B |
+| --- | --- | --- |
+| single-search questions | works | works |
+| two-step pivot (find an event, then follow that exact process) | 0 of 3 attempts | 2 of 3 |
+| per turn | ~60–90s | ~90–120s, growing with the transcript |
+
+The 14B only reached 2 of 3 after the library was given an entry demonstrating the two-turn
+shape. A two-hop investigation on the 14B takes minutes, not seconds. That is the cost of
+the air-gapped path, and you should know it before choosing that path. Because those
+numbers are normal rather than pathological, `SOC_LLM_TIMEOUT` defaults to **900s for the
+local backend** and 120s for the hosted one. A hosted API silent for two minutes is broken,
+whereas a local model silent for two minutes is thinking. A local timeout says so explicitly
+instead of reading as an outage. See F3 and F5 above.
+
+**The shipped detection library is tuned to this dataset and is not portable.** Field
+*names* are discovered at runtime and nothing is hardcoded per dataset, but that claim stops
+at field names:
+
+* `schema.py` defaults `--index` to `logforge`.
+* **15 of the 20** entries filter `Channel="Microsoft-Windows-Sysmon/Operational"`. On an
+  index without Sysmon they return zero rows: valid SPL, real fields, nothing found.
+* **2** filter a source filename directly (`source="*logforge_pf.csv"`,
+  `*logforge_mft.csv`), and the library's header block names all three CSVs as the map of
+  which artifact holds which fields.
+* **1** filters `Channel="Security"` for logon events.
+* **2** are artifact-agnostic and would run anywhere (`event-volume-by-type`,
+  `pick-the-source-for-the-question`).
+
+The engine is general; the shipped detections are a starter set for one collection. The
+discovery layer will read your schema and the guardrails will police your
+queries, but the examples the model adapts from are these.
+
+`soc_copilot/spl_library.toml` holds known-good detections (attack -> canonical SPL). The
+generator retrieves the closest entries and adapts their *pattern*; it does not improvise
+from zero. Retrieval always includes both a flat-filtering and a payload-extraction example,
+so the contrast is always in front of the model.
+
+**On any dataset other than this one, you must replace the shipped entries before relying
+on the tool.** The 20 entries here encode a specific collection: Sysmon channel names, three CSV
+source filenames, the event ids that collection contains. Point the tool at a different index
+and the majority of them match nothing, which on the local backend is the worst case: the
+model has no near example to adapt, so it produces a near-miss query or concludes the data is
+absent. Budget for writing entries against your own data before judging the local path. The
+loader validates structure and fails closed on a malformed entry, so a bad one is a startup
+error rather than a bad answer.
+
+What the shipped set does cover, for calibration: Sysmon event ids 1, 3, 10, 11 and 22;
+Security 4624 (interactive logon only); MFT file-creation by path; prefetch last-execution;
+and several artifact-agnostic methodology entries (stack counting, outliers, payload
+extraction, the two-step pivot). It does **not** cover registry persistence, scheduled tasks,
+service creation, image/driver load, remote thread injection, named pipes, WMI, failed logons,
+log clearing, PowerShell script-block logs, or browser history. Those questions have no
+covering entry today.
+
+**Validity is not correctness.** A query can pass every guardrail and still answer the wrong
+question (F1). An advisory check warns when the query's output carries no field of the kind
+the question asks about (F4), but it does not verify the answer is right. That is why every
+view shows the SPL and the rows beside the answer.
+
+**Scope.** SOC Copilot answers only what is indexed in Splunk. Raw-artifact work (content
+resident inside `$MFT`, UTF-16 strings, byte-level carving) is out of scope and belongs to
+the human analyst. "Not found" means "not in what was ingested", never "does not exist".
+[`SCOPE-BOUNDARY.md`](SCOPE-BOUNDARY.md) works one such case end to end: the tool pivots to
+find that a PowerShell process wrote `C:\Users\Public\README.txt`, correctly refuses to say
+what the file *contains*, and the analyst recovers the text from `$MFT`, where it turns out
+to be resident in 406 bytes behind a UTF-16 BOM. It also separates two mechanisms that
+are easy to conflate: the model declining is behaviour; literal anchoring is the guarantee.
+
+### Architecture overview
+
+The analyst asks a question in plain language; the system translates it to SPL, runs it
+read-only against a local Splunk instance, reads the rows that come back, and answers from
+those rows. It can also pivot: take an identifier out of one search's rows and filter the
+next search on it. The model decides *what to ask*; Splunk decides *what is true*.
+
+| stage | what it adds |
+| --- | --- |
+| 1 | config, an authenticated read-only REST client, real schema discovery |
+| 2 | question -> SPL, grounded in the discovered schema and a curated library |
+| 3 | the tool-using loop: run a search, read the rows, pivot, answer |
+| 4 | the guardrails as hard code, and three renderings of the result |
+
+**Stage 1 contains no LLM code of any kind.** It loads configuration (host + token) from the
+environment or a local `.env`, talks to Splunk's REST API over an authenticated, **read-only**
+client, and discovers the *real* schema (indexes, sourcetypes and field names) off the live
+index. Everything a later stage says about the data is grounded in rows this layer returned.
+Time ranges default to all-time, not `-24h`, because evidence is historical; TLS is relaxed
+for loopback only; a 401 surfaces as an actionable message, never a traceback.
+
+**Stage 2** translates a question into SPL against the discovered schema, including 827
+nested names found inside the `Payload` column at runtime, and adapts the closest entries in
+the curated library. Every generated query is validated against that schema before it is
+shown.
+
+**Stage 3** gives the model exactly one capability, `run_search`. It emits a JSON action,
+deterministic Python validates and runs it, and hands back the rows. Every executed query,
+its time range, its row count and its outcome are printed as they happen.
+
+**Stage 4** stops asking the model to behave: read-only enforcement by allowlist, literal
+anchoring, and nonce-sealed untrusted input are deterministic code in
+`soc_copilot/guardrails.py`, plus an advisory check that the query answers the question
+asked. The web UI is a loopback-only skin over the same engine and the same guardrails.
+
+How each of these works, and why, follows below.
+
+```
+soc_copilot/
+  config.py          SPLUNK_HOST / SPLUNK_TOKEN loading, TLS policy, secret hygiene
+  splunk_client.py   authenticated read-only REST client; dispatch -> poll -> results
+  schema.py          indexes, sourcetypes, real field names
+  payload_shape.py   Stage 2: runtime discovery of nested payload structure
+  library.py         Stage 2: curated known-good SPL, loaded from spl_library.toml
+  llm/               Stage 2: pluggable backends (anthropic | ollama)
+  generator.py       Stage 2: question -> grounded prompt -> SPL + time range
+  validation.py      Stage 2: deterministic checks on whatever the model returns
+  agent.py           Stage 3: the tool-using loop - search, read rows, pivot, answer
+  guardrails.py      Stage 4: read-only enforcement, literal anchoring, untrusted input
+  semantics.py       does the query answer the question? (advisory, see F4)
+  views.py           Stage 4: one result, three renderings (human | spl | json)
+  web.py             local web UI: loopback-only chat skin over investigate
+  cli.py             verify / schema / shape / search / generate / investigate
+tests/               482 tests, all offline against fakes — no live Splunk needed
+```
+
 ### Stage 1 — design decisions worth knowing
 
 **Time range is explicit and all-time by default.** `run_search(spl, earliest, latest)`

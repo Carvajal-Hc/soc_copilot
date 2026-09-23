@@ -115,7 +115,7 @@ def client():
         splunk.close()
         pytest.skip(
             f"index={INDEX} is empty or absent. See 'The dataset this demo runs "
-            "on' in README.md for how to build it."
+            "on' in SETUP.md for how to build it."
         )
 
     yield splunk
